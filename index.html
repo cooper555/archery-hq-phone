@@ -129,10 +129,17 @@ async function boot(code, pack, note) {
   window.HQ_PHONE = { source: DATA_BRANCHES[pack.branch], published: pack.date };
   // the PC's prefs (in the data) win on every launch; changes made on the phone last until the app restarts
   try { localStorage.removeItem('archeryhq_prefs'); } catch (e) {}
-  // there is no helper on the phone: fail its calls at once, like a PC whose helper is down
+  // there is no helper on the phone: Price Check goes to GitHub (see phonePriceCheck), every other helper call fails
+  // at once, like a PC whose helper is down
   const realFetch = window.fetch.bind(window);
-  window.fetch = (url, opts) => (typeof url === 'string' && url.startsWith('http://127.0.0.1:8787'))
-    ? Promise.reject(new TypeError('no helper on the phone')) : realFetch(url, opts);
+  window.fetch = (url, opts) => {
+    if (typeof url !== 'string' || !url.startsWith('http://127.0.0.1:8787')) return realFetch(url, opts);
+    const u = new URL(url);
+    if (u.pathname === '/api/pricecheck' && u.searchParams.get('q'))
+      return phonePriceCheck(u.searchParams.get('q').trim())
+        .then(d => new Response(JSON.stringify(d), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    return Promise.reject(new TypeError('no helper on the phone'));
+  };
 
   for (const el of [...doc.head.children]) {
     const src = el.getAttribute('src'), href = el.getAttribute('href');
@@ -155,6 +162,60 @@ async function boot(code, pack, note) {
     else await loadExternal(src);
   }
   badge(pack, note);
+}
+
+// ---------- Price Check through GitHub (.github/workflows/price-check.yml) ----------
+// Stores refuse a web page asking them directly, so the phone starts a short GitHub job and collects <req>.json from
+// the branch hq-price. Requests arriving within 1.5 s share one job (the shopping list's "Check all prices"), and a
+// term checked in the last 10 minutes is answered from memory. Needs the key's "Actions: Read and write".
+const PC_CACHE = {};
+let pcQueue = [], pcTimer = null;
+const sleep = ms => new Promise(ok => setTimeout(ok, ms));
+function phonePriceCheck(q) {
+  const hit = PC_CACHE[q.toLowerCase()];
+  if (hit && Date.now() - hit.at < 10 * 60e3) return Promise.resolve(hit.data);
+  return new Promise((ok, fail) => {
+    pcQueue.push({ q, ok, fail });
+    clearTimeout(pcTimer); pcTimer = setTimeout(pcFlush, 1500);
+  });
+}
+async function pcFlush() {
+  const batch = pcQueue.splice(0, 20);
+  if (pcQueue.length) pcTimer = setTimeout(pcFlush, 0);
+  const terms = [...new Set(batch.map(b => b.q))];
+  const req = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  try {
+    toast(`Price Check from the phone runs on GitHub: about 1–2 minutes for ${terms.length === 1 ? `"${terms[0]}"` : `${terms.length} items`}…`);
+    const r = await fetch(`${API}/actions/workflows/price-check.yml/dispatches`, { method: 'POST', headers: {
+      Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ref: 'main', inputs: { req, terms: JSON.stringify(terms) } }) });
+    if ([401, 403, 404].includes(r.status))
+      throw new Error('your phone key can\'t start Price Check yet. On GitHub, edit the "Archery HQ iPhone" key: Permissions → Actions → Read and write');
+    if (!r.ok) throw new Error(`GitHub said ${r.status}`);
+    const t0 = Date.now();
+    let res = null;
+    await sleep(20000);  // GitHub needs about 20 s just to start the machine
+    while (!res && Date.now() - t0 < 5 * 60e3) {
+      try { res = JSON.parse(await raw(`${req}.json`, 'hq-price')); } catch (e) { await sleep(5000); }
+    }
+    if (!res) throw new Error('GitHub took more than 5 minutes; try again');
+    for (const b of batch) {
+      const d = res.results[b.q] || { query: b.q, results: [], sites_checked: 0, checked_at: '', errors: ['no result'] };
+      PC_CACHE[b.q.toLowerCase()] = { at: Date.now(), data: d };
+      b.ok(d);
+    }
+  } catch (e) {
+    toast('Price Check: ' + e.message, true);
+    batch.forEach(b => b.fail(e));
+  }
+}
+function toast(msg, warn) {
+  const t = document.createElement('div');
+  t.textContent = msg;
+  t.style.cssText = `position:fixed;left:50%;transform:translateX(-50%);bottom:calc(3rem + env(safe-area-inset-bottom));z-index:80;max-width:min(26rem,calc(100vw - 2rem));
+    background:rgba(28,32,39,.96);border:1px solid ${warn ? '#b7791f' : '#3a4250'};color:${warn ? '#fbbf24' : '#e2e8f0'};border-radius:.75rem;padding:.6rem .8rem;font:13px/1.4 Inter,system-ui,sans-serif`;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), warn ? 9000 : 5000);
 }
 
 function ago(iso) {
@@ -180,16 +241,16 @@ function setup(msg) {
     <h1>Archery <span>HQ</span></h1>
     <p>This app reads your dashboard from your private GitHub repo. It needs a <b>read-only key</b>, made once:</p>
     <ol>
-      <li>Open <a href="https://github.com/settings/personal-access-tokens/new?name=Archery%20HQ%20iPhone&description=Read-only%20key%20for%20the%20Archery%20HQ%20phone%20app&target_name=cooper555&expires_in=366&contents=read" target="_blank" rel="noopener">GitHub → new fine-grained token</a> and sign in.</li>
+      <li>Open <a href="https://github.com/settings/personal-access-tokens/new?name=Archery%20HQ%20iPhone&description=Read-only%20key%20for%20the%20Archery%20HQ%20phone%20app&target_name=cooper555&expires_in=366&contents=read&actions=write" target="_blank" rel="noopener">GitHub → new fine-grained token</a> and sign in.</li>
       <li>Token name: <i>Archery HQ iPhone</i>. Expiration: the longest offered.</li>
       <li>Repository access: <b>Only select repositories</b> → <b>ArcheryHQ</b>.</li>
-      <li>Permissions → Repository → <b>Contents: Read-only</b>. Nothing else.</li>
+      <li>Permissions → Repository → <b>Contents: Read-only</b> and <b>Actions: Read and write</b> (Actions runs Price Check). Nothing else.</li>
       <li>Generate, copy it, and paste it here.</li>
     </ol>
     ${msg ? `<p class="err">${esc(msg)}</p>` : ''}
     <input id="tok" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="github_pat_…">
     <button id="save">Save and open</button>
-    <p class="muted">The key stays on this phone only. It can read the ArcheryHQ repo and nothing else, and can't change anything.
+    <p class="muted">The key stays on this phone only. It can read the ArcheryHQ repo and start its jobs, nothing else; it can't change your files.
       To revoke it, delete it on GitHub.</p>`;
   document.getElementById('save').onclick = () => {
     const v = document.getElementById('tok').value.trim();
