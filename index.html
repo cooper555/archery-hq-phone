@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Archery HQ</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Archery HQ">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#101216">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="manifest" href="manifest.webmanifest">
+<!--
+  Archery HQ on the iPhone — the "front door". This page holds no data and no dashboard code.
+  With a read-only GitHub key (stored only on this phone), it loads the dashboard (dashboard/ on main) and
+  the newest data (branch hq-phone from the GitHub cloud job, or hq-data from the home PC, whichever is
+  newer) from the private repo, keeps both in this phone's cache for offline use, and starts the dashboard.
+  Source of truth: phone/ in the ArcheryHQ repo; the public front-door repo is a copy of that folder.
+-->
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; background: #101216; color: #e2e8f0; font: 16px/1.5 Inter, system-ui, -apple-system, sans-serif; }
+  .door { max-width: 30rem; margin: 0 auto; padding: 2.5rem 1rem; }
+  .door h1 { font-size: 1.5rem; margin: 0 0 .25rem; } .door h1 span { color: #78a5f0; }
+  .door p, .door li { color: #a8b3c4; font-size: .95rem; }
+  .door ol { padding-left: 1.25rem; } .door li { margin: .35rem 0; }
+  .door a { color: #8cb6f4; }
+  .door input { width: 100%; box-sizing: border-box; padding: .75rem; border-radius: .75rem; border: 1px solid #3a4250;
+    background: #1c2027; color: #e2e8f0; font-size: 16px; margin: .75rem 0; }
+  .door button { width: 100%; padding: .8rem; border: 0; border-radius: .75rem; background: #4880e2; color: #fff; font-weight: 600; font-size: 1rem; }
+  .door .err { color: #fbbf24; } .door .muted { font-size: .8rem; color: #6b7686; }
+  .spin { text-align: center; padding-top: 40vh; color: #a8b3c4; }
+  #hqPhoneBadge { position: fixed; left: .5rem; bottom: calc(.5rem + env(safe-area-inset-bottom)); z-index: 60; display: flex; gap: .4rem;
+    align-items: center; font: 12px/1 Inter, system-ui, sans-serif; background: rgba(28,32,39,.92); color: #a8b3c4;
+    border: 1px solid #3a4250; border-radius: 999px; padding: .35rem .55rem; }
+  #hqPhoneBadge.warn { border-color: #b7791f; color: #fbbf24; }
+  #hqPhoneBadge button { background: none; border: 0; color: #8cb6f4; font: inherit; padding: 0 .15rem; }
+</style>
+</head>
+<body>
+<div id="door" class="spin">Loading Archery HQ…</div>
+<script>
+(() => {  // everything private: the dashboard's scripts declare their own globals (esc, $, D…) in this page
+'use strict';
+const REPO = 'cooper555/ArcheryHQ';
+let API = `https://api.github.com/repos/${REPO}`;
+try { API = localStorage.getItem('hqphone_api') || API; } catch (e) {}  // testing only: a local stand-in for GitHub
+const DATA_BRANCHES = { 'hq-phone': 'GitHub cloud', 'hq-data': 'home PC' };
+const TOKEN_KEY = 'hqphone_token';
+const CACHE = 'hqphone-v1';
+// generated on the PCs and not in git; the phone supplies its own stand-ins
+const SKIP = { 'archery_data.js': 1, 'helper_token.js': 1, 'ai_notes.js': 1 };
+
+const door = document.getElementById('door');
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+let token = '';
+try { token = localStorage.getItem(TOKEN_KEY) || ''; } catch (e) {}
+
+class AuthError extends Error {}
+
+async function gh(path, accept = 'application/vnd.github+json') {
+  const r = await fetch(API + path, { cache: 'no-store', headers: {
+    Authorization: `Bearer ${token}`, Accept: accept, 'X-GitHub-Api-Version': '2022-11-28' } });
+  if (r.status === 401 || r.status === 403 || r.status === 404) throw new AuthError(`GitHub said ${r.status} for ${path}`);
+  if (!r.ok) throw new Error(`GitHub said ${r.status} for ${path}`);
+  return r;
+}
+const raw = (path, ref) => gh(`/contents/${path}?ref=${encodeURIComponent(ref)}`, 'application/vnd.github.raw+json').then(r => r.text());
+
+// ---------- cache (Cache Storage: no 5 MB localStorage limit, survives offline launches) ----------
+async function cacheGet(key) {
+  try { const r = await (await caches.open(CACHE)).match(`/__hq/${key}`); return r ? r.json() : null; } catch (e) { return null; }
+}
+async function cachePut(key, obj) {
+  try { await (await caches.open(CACHE)).put(`/__hq/${key}`, new Response(JSON.stringify(obj))); } catch (e) {}
+}
+
+// ---------- the dashboard code at the tip of main ----------
+async function loadCode() {
+  const cached = await cacheGet('code');
+  const sha = (await (await gh('/commits/main', 'application/vnd.github.sha')).text()).trim();
+  if (cached && cached.sha === sha) return cached;
+  const html = await raw('dashboard/index.html', sha);
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const local = [...doc.querySelectorAll('script[src], link[rel="stylesheet"][href]')]
+    .map(el => el.getAttribute('src') || el.getAttribute('href'))
+    .filter(u => !/^(https?:)?\/\//.test(u) && !SKIP[u]);
+  const files = {};
+  await Promise.all(local.map(async u => { files[u] = await raw(`dashboard/${u}`, sha); }));
+  const code = { sha, html, files };
+  await cachePut('code', code);
+  return code;
+}
+
+// ---------- the newest data: cloud job or home PC ----------
+async function loadData() {
+  const cached = await cacheGet('data');
+  // a missing branch (hq-phone before the first cloud run) is skipped; both missing = the key is wrong
+  const tries = await Promise.allSettled(Object.keys(DATA_BRANCHES).map(async b => {
+    const j = await (await gh(`/branches/${b}`)).json();
+    return { branch: b, sha: j.commit.sha, date: j.commit.commit.committer.date };
+  }));
+  const best = tries.filter(t => t.status === 'fulfilled').map(t => t.value).sort((a, b) => (a.date < b.date ? 1 : -1))[0];
+  if (!best) throw tries[0].reason;
+  if (cached && cached.sha === best.sha) return cached;
+  const data = JSON.parse(await raw('archery_data.json', best.sha));
+  const out = { ...best, data };
+  await cachePut('data', out);
+  return out;
+}
+
+// ---------- start the dashboard exactly as index.html would ----------
+function runScript(text, name) {
+  const s = document.createElement('script');
+  s.textContent = `${text}\n//# sourceURL=${name}`;
+  document.body.appendChild(s);
+}
+const loadExternal = src => new Promise(ok => {
+  const s = document.createElement('script'); s.src = src; s.onload = s.onerror = ok; document.head.appendChild(s);
+});
+
+async function boot(code, pack, note) {
+  const doc = new DOMParser().parseFromString(code.html, 'text/html');
+  window.ARCHERY_DATA = pack.data;
+  window.HQ_TOKEN = '';
+  window.AI_NOTES = null;
+  window.HQ_PHONE = { source: DATA_BRANCHES[pack.branch], published: pack.date };
+  // the PC's prefs (in the data) win on every launch; changes made on the phone last until the app restarts
+  try { localStorage.removeItem('archeryhq_prefs'); } catch (e) {}
+  // there is no helper on the phone: fail its calls at once, like a PC whose helper is down
+  const realFetch = window.fetch.bind(window);
+  window.fetch = (url, opts) => (typeof url === 'string' && url.startsWith('http://127.0.0.1:8787'))
+    ? Promise.reject(new TypeError('no helper on the phone')) : realFetch(url, opts);
+
+  for (const el of [...doc.head.children]) {
+    const src = el.getAttribute('src'), href = el.getAttribute('href');
+    if (el.tagName === 'SCRIPT' && src) {
+      if (code.files[src] != null) runScript(code.files[src], src); else await loadExternal(src);
+    } else if (el.tagName === 'LINK' && el.rel === 'stylesheet') {
+      if (code.files[href] != null) { const st = document.createElement('style'); st.textContent = code.files[href]; document.head.appendChild(st); }
+      else document.head.appendChild(el.cloneNode());
+    }
+  }
+  const scripts = [...doc.body.querySelectorAll('script')];
+  scripts.forEach(s => s.remove());
+  for (const a of doc.body.attributes) document.body.setAttribute(a.name, a.value);
+  document.body.innerHTML = doc.body.innerHTML;
+  for (const s of scripts) {
+    const src = s.getAttribute('src');
+    if (!src) runScript(s.textContent, 'inline');
+    else if (SKIP[src]) continue;
+    else if (code.files[src] != null) runScript(code.files[src], src);
+    else await loadExternal(src);
+  }
+  badge(pack, note);
+}
+
+function ago(iso) {
+  const m = Math.max(0, Math.round((Date.now() - new Date(iso)) / 60000));
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  return h < 48 ? `${h} h ago` : `${Math.round(h / 24)} days ago`;
+}
+function badge(pack, note) {
+  const b = document.createElement('div');
+  b.id = 'hqPhoneBadge';
+  const old = Date.now() - new Date(pack.date) > 12 * 3600e3;
+  if (note || old) b.className = 'warn';
+  b.innerHTML = `<span>${note ? esc(note) + ' · ' : ''}Data from ${esc(DATA_BRANCHES[pack.branch])} · ${esc(ago(pack.date))}</span>
+    <button onclick="location.reload()" aria-label="Reload">↻</button><button onclick="this.parentElement.remove()" aria-label="Hide">✕</button>`;
+  document.body.appendChild(b);
+}
+
+// ---------- first launch: ask for the read-only key ----------
+function setup(msg) {
+  door.className = 'door';
+  door.innerHTML = `
+    <h1>Archery <span>HQ</span></h1>
+    <p>This app reads your dashboard from your private GitHub repo. It needs a <b>read-only key</b>, made once:</p>
+    <ol>
+      <li>Open <a href="https://github.com/settings/personal-access-tokens/new?name=Archery%20HQ%20iPhone&description=Read-only%20key%20for%20the%20Archery%20HQ%20phone%20app&target_name=cooper555&expires_in=366&contents=read" target="_blank" rel="noopener">GitHub → new fine-grained token</a> and sign in.</li>
+      <li>Token name: <i>Archery HQ iPhone</i>. Expiration: the longest offered.</li>
+      <li>Repository access: <b>Only select repositories</b> → <b>ArcheryHQ</b>.</li>
+      <li>Permissions → Repository → <b>Contents: Read-only</b>. Nothing else.</li>
+      <li>Generate, copy it, and paste it here.</li>
+    </ol>
+    ${msg ? `<p class="err">${esc(msg)}</p>` : ''}
+    <input id="tok" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="github_pat_…">
+    <button id="save">Save and open</button>
+    <p class="muted">The key stays on this phone only. It can read the ArcheryHQ repo and nothing else, and can't change anything.
+      To revoke it, delete it on GitHub.</p>`;
+  document.getElementById('save').onclick = () => {
+    const v = document.getElementById('tok').value.trim();
+    if (!v) return;
+    try { localStorage.setItem(TOKEN_KEY, v); } catch (e) {}
+    token = v; door.className = 'spin'; door.textContent = 'Loading Archery HQ…'; start();
+  };
+}
+
+async function start() {
+  if (!token) return setup('');
+  try {
+    const [code, pack] = await Promise.all([loadCode(), loadData()]);
+    await boot(code, pack, '');
+  } catch (e) {
+    if (e instanceof AuthError) return setup('GitHub refused that key (wrong, expired, or missing Contents: Read-only on ArcheryHQ). Make a new one.');
+    const [code, pack] = await Promise.all([cacheGet('code'), cacheGet('data')]);
+    if (code && pack) return boot(code, pack, 'Offline');
+    door.className = 'door';
+    door.innerHTML = `<h1>Archery <span>HQ</span></h1><p class="err">Couldn't load: ${esc(e.message)}</p><button onclick="location.reload()">Try again</button>`;
+  }
+}
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+start();
+})();
+</script>
+</body>
+</html>
