@@ -52,6 +52,9 @@ const TOKEN_KEY = 'hqphone_token';
 const CACHE = 'hqphone-v1';
 // generated on the PCs and not in git; the phone supplies its own stand-ins
 const SKIP = { 'archery_data.js': 1, 'helper_token.js': 1, 'ai_notes.js': 1 };
+// Eric's own files (data/<name>.json on main) and what each is when missing
+const MINE = { prefs: () => ({}), journal: () => [], shotlog: () => [], watchlist: () => [] };
+const OUTBOX_KEY = 'hqphone_outbox';
 
 const door = document.getElementById('door');
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -81,7 +84,7 @@ async function cachePut(key, obj) {
 async function loadCode() {
   const cached = await cacheGet('code');
   const sha = (await (await gh('/commits/main', 'application/vnd.github.sha')).text()).trim();
-  if (cached && cached.sha === sha) return cached;
+  if (cached && cached.sha === sha && cached.mine) return cached;
   const html = await raw('dashboard/index.html', sha);
   const doc = new DOMParser().parseFromString(html, 'text/html');
   const local = [...doc.querySelectorAll('script[src], link[rel="stylesheet"][href]')]
@@ -89,7 +92,12 @@ async function loadCode() {
     .filter(u => !/^(https?:)?\/\//.test(u) && !SKIP[u]);
   const files = {};
   await Promise.all(local.map(async u => { files[u] = await raw(`dashboard/${u}`, sha); }));
-  const code = { sha, html, files };
+  // Eric's own files from main, newer than the copy inside the data snapshot (the PCs sync them hourly)
+  const mine = {};
+  await Promise.all(Object.keys(MINE).map(async k => {
+    try { mine[k] = JSON.parse(await raw(`data/${k}.json`, sha)); } catch (e) { mine[k] = MINE[k](); }
+  }));
+  const code = { sha, html, files, mine };
   await cachePut('code', code);
   return code;
 }
@@ -127,17 +135,34 @@ async function boot(code, pack, note) {
   window.HQ_TOKEN = '';
   window.AI_NOTES = null;
   window.HQ_PHONE = { source: DATA_BRANCHES[pack.branch], published: pack.date };
-  // the PC's prefs (in the data) win on every launch; changes made on the phone last until the app restarts
-  try { localStorage.removeItem('archeryhq_prefs'); } catch (e) {}
-  // there is no helper on the phone: Price Check goes to GitHub (see phonePriceCheck), every other helper call fails
-  // at once, like a PC whose helper is down
+  // Eric's files from main, plus any phone edits GitHub hasn't saved yet, are what the dashboard starts from
+  startSaves(code.mine || {});
+  window.ARCHERY_DATA.prefs = copy(STATE.prefs);
+  try {
+    localStorage.removeItem('archeryhq_prefs');
+    localStorage.setItem('archeryhq_journal', JSON.stringify(STATE.journal));
+    localStorage.setItem('archeryhq_shotlog', JSON.stringify(STATE.shotlog));
+    localStorage.setItem('archeryhq_watch', JSON.stringify(STATE.watchlist));
+  } catch (e) {}
+  // there is no helper on the phone. Price Check, saving and Refresh go to GitHub jobs (below); every other helper
+  // call fails at once, like a PC whose helper is down
   const realFetch = window.fetch.bind(window);
+  const reply = d => new Response(JSON.stringify(d), { status: 200, headers: { 'Content-Type': 'application/json' } });
   window.fetch = (url, opts) => {
     if (typeof url !== 'string' || !url.startsWith('http://127.0.0.1:8787')) return realFetch(url, opts);
     const u = new URL(url);
     if (u.pathname === '/api/pricecheck' && u.searchParams.get('q'))
-      return phonePriceCheck(u.searchParams.get('q').trim())
-        .then(d => new Response(JSON.stringify(d), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+      return phonePriceCheck(u.searchParams.get('q').trim()).then(reply);
+    const kind = { '/api/prefs': 'prefs', '/api/journal': 'journal', '/api/shotlog': 'shotlog', '/api/watchlist': 'watchlist' }[u.pathname];
+    if (kind && opts && opts.method === 'POST') {
+      let body = null;
+      try { body = JSON.parse(opts.body); } catch (e) {}
+      const val = kind === 'prefs' ? body : body && (body.entries || body.items);
+      if (val && typeof val === 'object') phoneSave(kind, val);
+      return Promise.resolve(reply({ ok: true }));
+    }
+    if (u.pathname === '/api/refresh') return phoneRefresh().then(reply);
+    if (u.pathname === '/api/refresh/status') return refreshStatus().then(reply);
     return Promise.reject(new TypeError('no helper on the phone'));
   };
 
@@ -164,6 +189,124 @@ async function boot(code, pack, note) {
   badge(pack, note);
 }
 
+// ---------- GitHub jobs the phone starts (needs the key's "Actions: Read and write") ----------
+const newReq = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+async function dispatch(workflow, inputs) {
+  let r;
+  try {
+    r = await fetch(`${API}/actions/workflows/${workflow}/dispatches`, { method: 'POST', headers: {
+      Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ref: 'main', inputs }) });
+  } catch (e) { throw new Error('no connection to GitHub'); }
+  if ([401, 403, 404].includes(r.status))
+    throw new Error('your phone key can\'t start GitHub jobs yet. On GitHub, edit the "Archery HQ iPhone" key: Permissions → Actions → Read and write');
+  if (!r.ok) throw new Error(`GitHub said ${r.status}`);
+}
+
+// ---------- Saving edits through GitHub (.github/workflows/phone-save.yml + tools/cloud_save.py) ----------
+// The key can't write files, so the dashboard's saves (prefs, journal, scores, watches) go to a short GitHub job that
+// merges them into data/ on main as "Phone save <id>"; the PCs take it at their next hourly sync. Until GitHub confirms,
+// the edits wait in an outbox on this phone, are shown at the next launch, and are sent again (sending twice gives the
+// same files). The outbox keeps what the phone loaded (base), so an item deleted here stays deleted and an item added on
+// a PC meanwhile is kept. Edits within 4 s share one job.
+const LISTS = { journal: e => String(e.id || ''), shotlog: e => String(e.id || ''),
+  watchlist: it => it.type === 'keyword' ? 'kw:' + String(it.term || '').trim().toLowerCase() : String(it.url || '').split('?')[0] };
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+let STATE = {}, BASE = null, OUT = null, saveTimer = null;
+const copy = v => JSON.parse(JSON.stringify(v));  // the dashboard edits its prefs in place; base must not move with it
+const baseOf = s => Object.fromEntries([['prefs', copy(s.prefs)], ...Object.keys(LISTS).map(k => [k, s[k].map(LISTS[k])])]);
+function saveOut() { try { OUT ? localStorage.setItem(OUTBOX_KEY, JSON.stringify(OUT)) : localStorage.removeItem(OUTBOX_KEY); } catch (e) {} }
+// what main looks like once the job has run (the same merge as cloud_save.py)
+function merged(mine, ch) {
+  const s = { prefs: { ...mine.prefs, ...(ch.prefs ? ch.prefs.set : {}) } };
+  for (const k of Object.keys(LISTS)) {
+    if (!ch[k]) { s[k] = mine[k]; continue; }
+    const base = new Set(ch[k].base), have = new Set(ch[k].items.map(LISTS[k]));
+    s[k] = ch[k].items.concat(mine[k].filter(c => !have.has(LISTS[k](c)) && !base.has(LISTS[k](c))));
+  }
+  return s;
+}
+function startSaves(files) {
+  const mine = Object.fromEntries(Object.keys(MINE).map(k => [k, files[k] && typeof files[k] === 'object' ? files[k] : MINE[k]()]));
+  try { OUT = JSON.parse(localStorage.getItem(OUTBOX_KEY) || 'null'); } catch (e) { OUT = null; }
+  STATE = OUT ? merged(mine, OUT.changes) : mine;
+  BASE = OUT ? OUT.base : baseOf(mine);
+  if (OUT) setTimeout(resumeSaves, 3000);
+  window.addEventListener('online', () => { if (OUT && OUT.dirty) sendSaves(); });
+}
+function phoneSave(kind, val) {
+  STATE[kind] = copy(val);
+  if (!OUT) OUT = { base: BASE, touched: [], changes: {}, req: '', at: 0 };
+  if (!OUT.touched.includes(kind)) OUT.touched.push(kind);
+  const ch = {}, set = {};
+  for (const k of new Set([...Object.keys(STATE.prefs), ...Object.keys(OUT.base.prefs)]))
+    if (k !== 'setup' && !same(STATE.prefs[k], OUT.base.prefs[k])) set[k] = STATE.prefs[k];  // setup: old key the PC drops
+  if (Object.keys(set).length) ch.prefs = { set };
+  for (const k of Object.keys(LISTS)) if (OUT.touched.includes(k)) ch[k] = { items: STATE[k], base: OUT.base[k] };
+  OUT.changes = ch; OUT.dirty = true; saveOut();
+  clearTimeout(saveTimer); saveTimer = setTimeout(sendSaves, 4000);
+}
+async function sendSaves() {
+  if (!OUT || !OUT.dirty) return;
+  const req = newReq();
+  OUT.dirty = false;
+  try {
+    await dispatch('phone-save.yml', { req, changes: JSON.stringify(OUT.changes) });
+    OUT.req = req; OUT.at = Date.now(); saveOut();
+    toast('Saving to GitHub… (about a minute)');
+    confirmSave(req);
+  } catch (e) {
+    OUT.dirty = true; saveOut();
+    toast(`Kept on this phone for now (${e.message}). It goes to GitHub at the next launch.`, true);
+  }
+}
+async function savedOnGitHub(req) {
+  try { return (await (await gh('/commits?sha=main&per_page=30')).json()).some(c => c.commit.message.startsWith(`Phone save ${req}:`)); }
+  catch (e) { return false; }
+}
+function savedDone(req) {
+  if (!OUT || OUT.req !== req || OUT.dirty) return;  // newer edits are on their way; keep the outbox for them
+  OUT = null; BASE = baseOf(STATE); saveOut();
+}
+async function confirmSave(req) {
+  await sleep(25000);
+  for (const t0 = Date.now(); Date.now() - t0 < 4 * 60e3; await sleep(10000)) {
+    if (await savedOnGitHub(req)) { savedDone(req); toast('Saved to GitHub ✓ The PCs get it within the hour.'); return; }
+  }
+  if (OUT && OUT.req === req) toast('GitHub hasn\'t confirmed the save yet. It\'s sent again at the next launch.', true);
+}
+async function resumeSaves() {
+  if (OUT.req && await savedOnGitHub(OUT.req)) return savedDone(OUT.req);
+  if (OUT.dirty || Date.now() - OUT.at > 5 * 60e3) { OUT.dirty = true; sendSaves(); }
+  else confirmSave(OUT.req);
+}
+
+// ---------- Refresh through GitHub (.github/workflows/phone-data.yml, the same job as the 3-a-day schedule) ----------
+// Done when the branch hq-phone moves; the dashboard then reloads and the loader picks up the new data.
+let REFRESH = null;
+async function phoneRefresh() {
+  REFRESH = { at: Date.now(), checked: Date.now(), sha: '', failed: false };
+  try {
+    try { REFRESH.sha = (await (await gh('/branches/hq-phone')).json()).commit.sha; } catch (e) {}
+    await dispatch('phone-data.yml', {});
+    toast('Updating on GitHub: new deals, news and videos in about 8–10 minutes. You can close the app; the new data is there next time.');
+  } catch (e) {
+    REFRESH.failed = true;
+    toast('Update: ' + e.message, true);
+  }
+  return { ok: !REFRESH.failed };
+}
+async function refreshStatus() {
+  if (!REFRESH || REFRESH.failed) return { running: false, ok: false };
+  const elapsed = Math.round((Date.now() - REFRESH.at) / 1000);
+  if (Date.now() - REFRESH.checked > 20000) {
+    REFRESH.checked = Date.now();
+    try { if ((await (await gh('/branches/hq-phone')).json()).commit.sha !== REFRESH.sha) return { running: false, ok: true }; } catch (e) {}
+  }
+  if (elapsed > 25 * 60) return { running: false, ok: false };
+  return { running: true, elapsed };
+}
+
 // ---------- Price Check through GitHub (.github/workflows/price-check.yml) ----------
 // Stores refuse a web page asking them directly, so the phone starts a short GitHub job and collects <req>.json from
 // the branch hq-price. Requests arriving within 1.5 s share one job (the shopping list's "Check all prices"), and a
@@ -183,15 +326,10 @@ async function pcFlush() {
   const batch = pcQueue.splice(0, 20);
   if (pcQueue.length) pcTimer = setTimeout(pcFlush, 0);
   const terms = [...new Set(batch.map(b => b.q))];
-  const req = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const req = newReq();
   try {
     toast(`Price Check from the phone runs on GitHub: about 1–2 minutes for ${terms.length === 1 ? `"${terms[0]}"` : `${terms.length} items`}…`);
-    const r = await fetch(`${API}/actions/workflows/price-check.yml/dispatches`, { method: 'POST', headers: {
-      Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ref: 'main', inputs: { req, terms: JSON.stringify(terms) } }) });
-    if ([401, 403, 404].includes(r.status))
-      throw new Error('your phone key can\'t start Price Check yet. On GitHub, edit the "Archery HQ iPhone" key: Permissions → Actions → Read and write');
-    if (!r.ok) throw new Error(`GitHub said ${r.status}`);
+    await dispatch('price-check.yml', { req, terms: JSON.stringify(terms) });
     const t0 = Date.now();
     let res = null;
     await sleep(20000);  // GitHub needs about 20 s just to start the machine
@@ -244,14 +382,14 @@ function setup(msg) {
       <li>Open <a href="https://github.com/settings/personal-access-tokens/new?name=Archery%20HQ%20iPhone&description=Read-only%20key%20for%20the%20Archery%20HQ%20phone%20app&target_name=cooper555&expires_in=366&contents=read&actions=write" target="_blank" rel="noopener">GitHub → new fine-grained token</a> and sign in.</li>
       <li>Token name: <i>Archery HQ iPhone</i>. Expiration: the longest offered.</li>
       <li>Repository access: <b>Only select repositories</b> → <b>ArcheryHQ</b>.</li>
-      <li>Permissions → Repository → <b>Contents: Read-only</b> and <b>Actions: Read and write</b> (Actions runs Price Check). Nothing else.</li>
+      <li>Permissions → Repository → <b>Contents: Read-only</b> and <b>Actions: Read and write</b> (Actions runs Price Check, saving and Refresh). Nothing else.</li>
       <li>Generate, copy it, and paste it here.</li>
     </ol>
     ${msg ? `<p class="err">${esc(msg)}</p>` : ''}
     <input id="tok" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="github_pat_…">
     <button id="save">Save and open</button>
-    <p class="muted">The key stays on this phone only. It can read the ArcheryHQ repo and start its jobs, nothing else; it can't change your files.
-      To revoke it, delete it on GitHub.</p>`;
+    <p class="muted">The key stays on this phone only. It can read the ArcheryHQ repo and start its jobs (Price Check, saving your edits,
+      updating the data), nothing else; it can't change the files itself. To revoke it, delete it on GitHub.</p>`;
   document.getElementById('save').onclick = () => {
     const v = document.getElementById('tok').value.trim();
     if (!v) return;
